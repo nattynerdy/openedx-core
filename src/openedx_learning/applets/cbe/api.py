@@ -4,10 +4,11 @@ Public API for Competency-Based Education (CBE).
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Iterable, Sequence, cast
+from typing import Any, cast
 
 from django.core.exceptions import NON_FIELD_ERRORS, PermissionDenied, ValidationError
 from django.db import IntegrityError, connection, transaction
@@ -426,6 +427,7 @@ def _get_ancestor_and_descendant_tag_ids(tag: Tag) -> set[int]:
     Return the ids of every taxonomy ancestor and descendant of ``tag``.
 
     The blocked-courses read and the write-time containment check both use this, so they cannot disagree.
+    Archived tags are not included, so an archived ancestor or descendant does not block.
     """
     return (
         set(get_ancestor_tags(tag).values_list("id", flat=True))

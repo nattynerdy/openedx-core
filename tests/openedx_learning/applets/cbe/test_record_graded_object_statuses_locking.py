@@ -151,9 +151,10 @@ def test_lock_is_one_bulk_call_regardless_of_criteria_count(
     ]
     assert len(lock_updates) == 1
     objecttag_queries = [q["sql"] for q in captured.captured_queries if "oel_tagging_objecttag" in q["sql"]]
-    # Three queries touch the table whatever the criteria count: the criteria SELECT (which joins it through
-    # select_related), then the lock's SELECT of pk and deletion_locked, then the lock's single UPDATE.
-    assert len(objecttag_queries) == 3
+    # Four queries touch the table whatever the criteria count: the criteria SELECT (which joins it through
+    # select_related), then the lock's SELECT of the rows it will change, its single UPDATE, and the SELECT that
+    # confirms none of those rows lost its tag or taxonomy in the meantime.
+    assert len(objecttag_queries) == 4
     assert ObjectTag.objects.filter(object_id=object_id, deletion_locked=True).count() == criteria_count
 
 
