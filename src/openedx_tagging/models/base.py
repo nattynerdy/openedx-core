@@ -5,11 +5,13 @@ Tagging app base data models
 from __future__ import annotations
 
 import re
-from typing import ClassVar, Self, cast
+from collections.abc import Callable
+from functools import partial
+from typing import ClassVar, NamedTuple, Self, TypeVar, cast
 
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
-from django.db import models
-from django.db.models import F, Value
+from django.db import IntegrityError, connections, models, router, transaction
+from django.db.models import F, ProtectedError, Value
 from django.db.models.functions import Concat, Length, Replace, Substr
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
@@ -75,6 +77,63 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
             .exclude(tag__archived=True)
             .exclude(taxonomy__archived=True)
         )
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        """
+        Delete these object tags, except that deletion-locked ones are archived instead.
+
+        A deletion-locked object tag is kept in the database with ``archived=True``, because something outside the
+        tagging app depends on it. Archived object tags are counted as deleted in the result, so a caller can't tell
+        which of the two happened.
+
+        :return: Django's ``(total, {model_label: count})`` result, counting archived object tags as deleted.
+        """
+        # A model with a cascading foreign key to ObjectTag makes Django read the rows and then delete them by
+        # primary key, so a `deletion_locked=False` filter would only be checked at read time. Locking the rows
+        # first makes a concurrent lock_object_tags_for_deletion() call wait, find the row gone, and raise
+        # DoesNotExist, instead of locking a row that this transaction then deletes.
+        # No test covers this: it would need two concurrent transactions.
+        row_locking_queryset = self.select_for_update()
+        # A queryset marked for update names the write database as its .db, and still honors an explicit .using().
+        database_alias = row_locking_queryset.db
+        if connections[database_alias].features.has_select_for_update_of:
+            # of=("self",) keeps MySQL and PostgreSQL from also locking the joined Tag and Taxonomy rows, and
+            # MariaDB doesn't support it.
+            row_locking_queryset = row_locking_queryset.select_for_update(of=("self",))
+        write_database_object_tags = self.model.objects.using(database_alias)
+
+        with transaction.atomic(using=database_alias):
+            deletion_locked_by_id = dict(row_locking_queryset.values_list("pk", "deletion_locked"))
+            ids_to_archive = []
+            ids_to_delete = []
+            for object_tag_id, deletion_locked in deletion_locked_by_id.items():
+                if deletion_locked:
+                    ids_to_archive.append(object_tag_id)
+                else:
+                    ids_to_delete.append(object_tag_id)
+
+            archived_count = write_database_object_tags.filter(pk__in=ids_to_archive).update(archived=True)
+            # Call Django's implementation directly, since this method would otherwise recurse into itself.
+            deleted_count, deleted_count_by_model = models.QuerySet.delete(
+                write_database_object_tags.filter(pk__in=ids_to_delete)
+            )
+
+        self._result_cache = None
+        return self._count_archived_as_deleted(archived_count, deleted_count, deleted_count_by_model)
+
+    def _count_archived_as_deleted(
+        self,
+        archived_count: int,
+        deleted_count: int,
+        deleted_count_by_model: dict[str, int],
+    ) -> tuple[int, dict[str, int]]:
+        """
+        Add the number of archived object tags to the result that Django's delete returned.
+        """
+        if archived_count:
+            model_label = self.model._meta.label
+            deleted_count_by_model[model_label] = deleted_count_by_model.get(model_label, 0) + archived_count
+        return deleted_count + archived_count, deleted_count_by_model
 
 
 class Tag(models.Model):
@@ -269,8 +328,14 @@ class Tag(models.Model):
 
         super().save(*args, **kwargs)
 
-        # Cascade lineage (and depth, if it changed) to all descendants in a single UPDATE.
-        if old_values is not None and old_values["lineage"] and old_values["lineage"] != self.lineage:
+        # Cascade lineage (and depth, if it changed) to all descendants in a single UPDATE. Tags without a taxonomy
+        # have no tree to cascade into, and filtering on taxonomy=None would match unrelated taxonomy-less tags.
+        if (
+            old_values is not None
+            and self.taxonomy_id is not None
+            and old_values["lineage"]
+            and old_values["lineage"] != self.lineage
+        ):
             depth_delta = self.depth - old_values["depth"]
             update_kwargs: dict = {
                 # Expression to compute the new lineage for each descendent:
@@ -318,6 +383,92 @@ class TagIsArchived(Tag.DoesNotExist):
 
 
 Tag.IsArchived = TagIsArchived
+
+
+_T = TypeVar("_T")
+
+# How many times a delete is tried before concurrent writes are allowed to fail it.
+_DELETE_ATTEMPTS = 3
+
+
+class ConcurrentDeleteError(Exception):
+    """
+    Raised when a tag or taxonomy delete gives up because other requests kept writing tagging records.
+
+    Nothing was changed, and the same request can be made again. This is separate from a database error, so
+    that callers can tell "try again" apart from "something is wrong".
+    """
+
+
+class _ConcurrentWrite(Exception):
+    """Raised inside a delete attempt that finds another transaction changed what it had read."""
+
+
+def _retry_on_concurrent_write(attempt: Callable[[], _T]) -> _T:
+    """
+    Run ``attempt`` in a transaction and return its result, trying again if a concurrent write got in its way.
+
+    An attempt writes first and then checks whether another transaction changed what it had read. If one did,
+    or if the database refuses the delete, the attempt is rolled back and the next one reads the new state.
+
+    When the caller is already in a transaction, each attempt is a savepoint, and the caller's transaction stays
+    usable after a failed attempt. A database deadlock is the exception: it raises ``OperationalError``, which is
+    not retried, and the database rolls back the caller's whole transaction.
+
+    :raises ConcurrentDeleteError: If the last of the attempts fails one of its own checks.
+    :raises IntegrityError: If the database refuses the last attempt. It is raised as it is, since a refusal
+        that survives every attempt may not be a concurrent write at all.
+    :raises ProtectedError: Straight away, since another attempt would raise it again.
+    """
+    attempts_left = _DELETE_ATTEMPTS
+    while True:
+        attempts_left -= 1
+        try:
+            with transaction.atomic():
+                return attempt()
+        except ProtectedError:
+            raise
+        except IntegrityError:
+            if not attempts_left:
+                raise
+        except _ConcurrentWrite as exc:
+            if not attempts_left:
+                raise ConcurrentDeleteError(
+                    f"Gave up after {_DELETE_ATTEMPTS} attempts, because other requests kept writing tagging records."
+                ) from exc
+
+
+class _RemovalTag(NamedTuple):
+    """The columns of a Tag that ``Taxonomy.delete_tags()`` needs to decide between archiving and deleting it."""
+
+    pk: int
+    parent_id: int | None
+    archived: bool
+
+
+def _split_archive_and_delete(
+    removal: dict[int, _RemovalTag], locked_ids: set[int],
+) -> tuple[set[int], list[int]]:
+    """
+    Split the tags in ``removal``, keyed by id, into the ids to archive and the ids at the top of each subtree
+    to delete.
+
+    A tag is archived if it is in ``locked_ids`` or is above a tag that is. Deleting the top of each subtree is
+    enough, since the cascade from ``Tag.parent`` removes the rest.
+    """
+    archive_ids: set[int] = set()
+    for locked_id in locked_ids:
+        # Walk up from each locked tag, stopping at the edge of ``removal`` or at a tag already handled.
+        tag_id: int | None = locked_id
+        while tag_id is not None and tag_id in removal and tag_id not in archive_ids:
+            archive_ids.add(tag_id)
+            tag_id = removal[tag_id].parent_id
+    delete_roots = [
+        tag.pk
+        for tag in removal.values()
+        if tag.pk not in archive_ids and (tag.parent_id not in removal or tag.parent_id in archive_ids)
+    ]
+    return archive_ids, delete_roots
 
 
 class Taxonomy(models.Model):
@@ -682,14 +833,30 @@ class Taxonomy(models.Model):
         if tag_to_update.archived:
             raise ValueError(f"Cannot update the archived tag '{tag_to_update.value}'.")
         tag_to_update.value = new_value
-        tag_to_update.save()
+        with transaction.atomic():
+            # Every column that Tag.save() computes or this instance carries is written, except `archived`, so that
+            # an archive made since the tag was read isn't overwritten. The parent goes with the depth and lineage
+            # computed from it, so the three always agree.
+            tag_to_update.save(update_fields=["value", "lineage", "depth", "parent", "external_id"])
+            # The tag or the taxonomy may have been archived since the checks above, so they are made again, and
+            # the rename is rolled back if either was.
+            if not self.tag_set.unarchived().filter(pk=tag_to_update.pk).exists():
+                raise ValueError("update_tag() doesn't work for archived taxonomies or tags. They cannot be modified.")
         return tag_to_update
 
     def delete_tags(self, tags: list[str], with_subtags: bool = False):
         """
-        Delete the Taxonomy Tags provided. If any of them have children and
-        the `with_subtags` is not set to `True` it will fail, otherwise
-        the sub-tags will be deleted as well.
+        Delete the Taxonomy Tags provided. With `with_subtags`, their sub-tags are deleted as well.
+
+        A tag is archived instead if it, or any tag beneath it, has a deletion-locked association (``ObjectTag``).
+
+        :raises ValueError: If the taxonomy is free-text or read-only, if a value is not a tag of this taxonomy, or
+            if a tag has unarchived sub-tags, at any depth, and `with_subtags` is not `True`.
+        :raises ConcurrentDeleteError: If tags or deletion locks kept being added beneath these tags on every
+            attempt.
+        :raises ProtectedError: If none of the tags is archived by the rule above but another model still protects
+            one of them from deletion.
+        :raises IntegrityError: If the database refused every attempt to delete the tags.
         """
         if self.allow_free_text:
             raise ValueError(
@@ -701,24 +868,68 @@ class Taxonomy(models.Model):
                 "delete_tags() doesn't work for read-only taxonomies. They cannot be modified."
             )
 
-        tags_to_delete = self.tag_set.filter(value__in=tags)
+        _retry_on_concurrent_write(partial(self._delete_or_archive_tags, tags, with_subtags))
 
-        if tags_to_delete.count() != len(tags):
+    def _delete_or_archive_tags(self, tags: list[str], with_subtags: bool) -> None:
+        """
+        Make one attempt at ``delete_tags()``. Needs a transaction.
+
+        The checks after the writes catch a tag or a deletion lock that another transaction added after the
+        reads, and raise so that this attempt is rolled back and made again. They do not catch an association
+        that already was deletion-locked without a tag and was relinked to one of these tags meanwhile.
+        """
+        removal = self._collect_subtrees(tags, with_subtags)
+        locked = ObjectTag.objects.filter(tag_id__in=list(removal), deletion_locked=True)
+        archive_ids, delete_roots = _split_archive_and_delete(removal, set(locked.values_list("tag_id", flat=True)))
+        if archive_ids:
+            self.tag_set.filter(id__in=archive_ids).update(archived=True)
+        if not delete_roots:
+            # With nothing to delete, the checks below have nothing to count, so the tags are collected again.
+            if self._collect_subtrees(tags, with_subtags).keys() != removal.keys():
+                raise _ConcurrentWrite("Tags were added or removed beneath the tags being archived.")
+            return
+
+        # Deleting a tag clears the tag of its associations. A deletion-locked association in this taxonomy that
+        # has no tag after the delete, and had one before, is one this delete should have archived for.
+        orphaned = self.objecttag_set.filter(deletion_locked=True, tag__isnull=True)
+        orphaned_before = set(orphaned.values_list("pk", flat=True))
+        _total, deleted = self.tag_set.filter(id__in=delete_roots).delete()
+        if deleted.get(Tag._meta.label, 0) != len(removal) - len(archive_ids):
+            raise _ConcurrentWrite("Tags were added or removed beneath the tags being deleted.")
+        if orphaned.exclude(pk__in=orphaned_before).exists():
+            raise _ConcurrentWrite("A tag association was deletion-locked while its tag was being deleted.")
+
+    def _collect_subtrees(self, tags: list[str], with_subtags: bool) -> dict[int, _RemovalTag]:
+        """
+        Return this taxonomy's tags named in ``tags``, and every tag beneath them, by id.
+
+        Sub-tags are found through ``parent_id``, as the cascade from ``Tag.parent`` finds them, and archived ones
+        are included.
+
+        Raises ValueError if a value in ``tags`` is not a tag of this taxonomy, or if a tag has unarchived sub-tags
+        and ``with_subtags`` is false.
+        """
+        level = self._removal_tags(value__in=tags)
+        if len(level) != len(tags):
             # If they do not match that means there is one or more Tag ID(s)
             # provided that do not belong to this Taxonomy
             raise ValueError("Invalid tag id provided or tag id does not belong to taxonomy")
 
-        # Check if any Tag contains subtags (children)
-        contains_children = tags_to_delete.filter(children__isnull=False).distinct().exists()
+        removal = {tag.pk: tag for tag in level}
+        while level:
+            level = self._removal_tags(parent_id__in=[tag.pk for tag in level])
+            if not with_subtags and any(not tag.archived for tag in level):
+                raise ValueError(
+                    "Tag(s) contain children, `with_subtags` must be `True` for "
+                    "all Tags and their subtags (children) to be deleted."
+                )
+            level = [tag for tag in level if tag.pk not in removal]
+            removal.update((tag.pk, tag) for tag in level)
+        return removal
 
-        if contains_children and not with_subtags:
-            raise ValueError(
-                "Tag(s) contain children, `with_subtags` must be `True` for "
-                "all Tags and their subtags (children) to be deleted."
-            )
-
-        # Delete the Tags with their subtags if any
-        tags_to_delete.delete()
+    def _removal_tags(self, **filters) -> list[_RemovalTag]:
+        """Return this taxonomy's tags that match ``filters``."""
+        return [_RemovalTag(*row) for row in self.tag_set.filter(**filters).values_list("id", "parent_id", "archived")]
 
     def validate_value(self, value: str) -> bool:
         """
@@ -781,6 +992,9 @@ class ObjectTag(models.Model):
 
     Also, if an ObjectTag is associated with free-text Taxonomy, then the tag's value won't be stored as a standalone
     Tag in the database -- it'll be stored here.
+
+    Calling ``delete()`` on an ObjectTag, or on a queryset of them, archives an object tag that is deletion-locked
+    instead of removing it. The returned counts include archived object tags, and raw SQL bypasses this.
     """
 
     id = models.BigAutoField(primary_key=True)
@@ -865,6 +1079,29 @@ class ObjectTag(models.Model):
                 self._export_id = self.taxonomy.export_id
             if not self._value and self.tag:
                 self._value = self.tag.value
+
+    def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
+        """
+        Delete this object tag, or archive it instead if it is deletion-locked.
+
+        A deletion-locked object tag is kept in the database, and ``self.archived`` is set to match. Archiving
+        is counted as a deletion in the result, so a caller can't tell which of the two happened.
+
+        :param using: The database alias to delete from, defaulting to the one Django's router picks for writes.
+        :raises ValueError: If the object tag hasn't been saved.
+        """
+        if self.pk is None:
+            raise ValueError(
+                f"{type(self).__name__} object can't be deleted because its id attribute is set to None."
+            )
+        database_alias = using or router.db_for_write(type(self), instance=self)
+        this_object_tag = type(self).objects.using(database_alias).filter(pk=self.pk)
+        delete_result = this_object_tag.delete()
+        if this_object_tag.exists():
+            self.archived = True
+        else:
+            self.pk = None
+        return delete_result
 
     def __repr__(self):
         """

@@ -11,9 +11,12 @@ import ddt  # type: ignore[import]
 import pytest
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import connection, transaction
+from django.db.models import ProtectedError, QuerySet
 from django.db.utils import IntegrityError
+from django.test import override_settings
 from django.test.testcases import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from openedx_tagging import api
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
@@ -24,7 +27,7 @@ from openedx_tagging.tasks import (
     emit_content_object_associations_changed_for_tag_task,
 )
 
-from .utils import pretty_format_tags
+from .utils import concurrent_write, pretty_format_tags
 
 
 def get_tag(value):
@@ -1088,6 +1091,23 @@ class TestTagLineage(TestCase):
         assert charlie.child_count == 1
         assert charlie.descendant_count == 3
 
+    def test_save_taxonomy_less_tag_does_not_cascade_to_other_taxonomy_less_tags(self):
+        """
+        Tags without a taxonomy have no tree of their own, so renaming one must not rewrite the lineage of other
+        taxonomy-less tags that happen to share its old lineage prefix.
+        """
+        # `external_id` is set because save() can only generate one from a taxonomy.
+        tag = Tag.objects.create(taxonomy=None, value="Orphan", external_id="orphan")
+        other_root = Tag.objects.create(taxonomy=None, value="Orphan", external_id="other_orphan")
+        other_child = Tag.objects.create(taxonomy=None, value="Child", external_id="other_child", parent=other_root)
+        assert other_child.lineage == "Orphan\tChild\t"
+
+        tag.value = "Renamed"
+        tag.save()
+
+        other_child.refresh_from_db()
+        assert other_child.lineage == "Orphan\tChild\t"
+
     # TODO: The following event-emission tests don't really belong in TestTagLineage.
     # They should be moved to a separate test_events.py module.
     @patch("openedx_tagging.signal_handlers.emit_content_object_associations_changed_for_tag_task.delay")
@@ -1319,3 +1339,412 @@ class TestTagExternalIdGeneration(TestTagTaxonomyMixin, TestCase):
             read_only_taxonomy.update_tag("RO Tag", "Renamed")
         with pytest.raises(ValueError):
             read_only_taxonomy.delete_tags(["RO Tag"])
+
+
+class ReplicaRouter:
+    """
+    Sends reads to a database alias that isn't configured, and writes to the default one.
+    """
+
+    def db_for_read(self, _model, **_hints):
+        return "replica"
+
+    def db_for_write(self, _model, **_hints):
+        return "default"
+
+
+class TestObjectTagDelete(TestTagTaxonomyMixin, TestCase):
+    """
+    Test that deleting ObjectTags archives deletion-locked ones instead of removing them.
+    """
+
+    def _object_tag(self, object_id: str, value: str, locked: bool = False) -> ObjectTag:
+        return ObjectTag.objects.create(
+            object_id=object_id,
+            taxonomy=self.free_text_taxonomy,
+            _value=value,
+            deletion_locked=locked,
+        )
+
+    def test_direct_deletes_archive_locked_rows(self) -> None:
+        """
+        AC: instance and bulk deletes archive locked rows, remove unlocked ones, and return the same shape for both.
+        """
+        label = ObjectTag._meta.label
+        locked = self._object_tag("obj1", "locked", locked=True)
+
+        assert locked.delete() == (1, {label: 1})
+
+        assert locked.archived is True
+        assert locked.pk is not None
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+
+        unlocked = self._object_tag("obj2", "unlocked")
+        pk = unlocked.pk
+
+        assert unlocked.delete() == (1, {label: 1})
+
+        assert unlocked.pk is None
+        assert not ObjectTag.objects.filter(pk=pk).exists()
+
+        bulk_locked = self._object_tag("obj3", "locked", locked=True)
+        bulk_unlocked = self._object_tag("obj3", "unlocked")
+
+        bulk = ObjectTag.objects.filter(object_id="obj3")
+        assert len(list(bulk)) == 2  # Evaluate it, so the delete has a result cache to clear
+
+        assert bulk.delete() == (2, {label: 2})
+
+        assert [(t.pk, t.archived) for t in bulk] == [(bulk_locked.pk, True)]
+        assert not ObjectTag.objects.filter(pk=bulk_unlocked.pk).exists()
+
+    def test_deleting_an_unsaved_object_tag_raises(self) -> None:
+        """
+        Deleting an object tag that was never saved raises the same error as Django's own `Model.delete()`.
+        """
+        unsaved = ObjectTag(object_id="obj1", taxonomy=self.free_text_taxonomy, _value="value")
+        with pytest.raises(ValueError, match="can't be deleted because its id attribute is set to None"):
+            unsaved.delete()
+
+    def test_bulk_delete_of_only_locked_or_only_unlocked_object_tags(self) -> None:
+        """
+        A bulk delete returns the right counts when every object tag is locked, and when none is.
+        """
+        label = ObjectTag._meta.label
+        self._object_tag("obj1", "locked one", locked=True)
+        self._object_tag("obj1", "locked two", locked=True)
+        self._object_tag("obj2", "unlocked")
+
+        assert ObjectTag.objects.filter(object_id="obj1").delete() == (2, {label: 2})
+        assert ObjectTag.objects.filter(object_id="obj2").delete() == (1, {label: 1})
+        assert ObjectTag.objects.filter(object_id="nothing here").delete() == (0, {})
+        assert ObjectTag.objects.filter(object_id="obj1", archived=True).count() == 2
+        assert not ObjectTag.objects.filter(object_id="obj2").exists()
+
+    def test_bulk_delete_uses_write_database(self) -> None:
+        """
+        A bulk delete locks, archives and deletes on the write database, never the read one.
+        """
+        locked = self._object_tag("obj1", "locked", locked=True)
+        unlocked = self._object_tag("obj1", "unlocked")
+
+        # The read alias isn't configured, so any query routed to it would raise.
+        with override_settings(DATABASE_ROUTERS=[ReplicaRouter()]):
+            result = ObjectTag.objects.filter(object_id="obj1").delete()
+
+        assert result == (2, {ObjectTag._meta.label: 2})
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+        assert not ObjectTag.objects.filter(pk=unlocked.pk).exists()
+
+    def test_instance_delete_uses_write_database(self) -> None:
+        """
+        Deleting an object tag instance locks, archives and deletes on the write database, never the read one.
+        """
+        locked = self._object_tag("obj1", "locked", locked=True)
+        unlocked = self._object_tag("obj1", "unlocked")
+
+        # The read alias isn't configured, so any query routed to it would raise.
+        with override_settings(DATABASE_ROUTERS=[ReplicaRouter()]):
+            locked_result = locked.delete()
+            unlocked_result = unlocked.delete()
+
+        assert locked_result == (1, {ObjectTag._meta.label: 1})
+        assert unlocked_result == (1, {ObjectTag._meta.label: 1})
+        assert ObjectTag.objects.get(pk=locked.pk).archived is True
+        assert unlocked.pk is None
+
+
+@ddt.ddt
+class TestTaxonomyDeleteTags(TestTagTaxonomyMixin, TestCase):
+    """
+    Test that Taxonomy.delete_tags() archives tags that a deletion-locked association depends on, and deletes the rest.
+    """
+
+    def _lock(self, value: str, object_id: str = "locked-object") -> ObjectTag:
+        """Tag `object_id` with the tag `value` and lock that association against deletion."""
+        api.tag_object(object_id, self.taxonomy, [value])
+        object_tag = ObjectTag.objects.get(object_id=object_id, tag__value=value)
+        api.lock_object_tags_for_deletion(object_tag.pk)
+        return object_tag
+
+    def _archived_values(self) -> set[str]:
+        return set(self.taxonomy.tag_set.filter(archived=True).values_list("value", flat=True))
+
+    def _existing(self, *values: str) -> set[str]:
+        return set(self.taxonomy.tag_set.filter(value__in=values).values_list("value", flat=True))
+
+    def test_locked_tag_is_archived(self) -> None:
+        object_tag = self._lock("DPANN")
+        dpann = get_tag("DPANN")
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+        object_tag.refresh_from_db()
+        assert object_tag.tag_id == dpann.pk
+        assert object_tag.taxonomy_id == self.taxonomy.pk
+
+    def test_unlocked_ancestor_of_locked_tag_is_archived(self) -> None:
+        self._lock("Mammalia")
+
+        self.taxonomy.delete_tags(["Eukaryota"], with_subtags=True)
+
+        assert self._archived_values() == {"Eukaryota", "Animalia", "Chordata", "Mammalia"}
+        assert self._existing("Plantae", "Fungi", "Protista", "Monera", "Arthropoda") == set()
+
+    def test_unlocked_subtree_is_fully_deleted(self) -> None:
+        self.taxonomy.delete_tags(["Eukaryota"], with_subtags=True)
+
+        assert self._existing("Eukaryota", "Animalia", "Plantae", "Chordata", "Arthropoda", "Mammalia") == set()
+        assert self._existing("Bacteria", "Archaea") == {"Bacteria", "Archaea"}
+
+    def test_archived_locked_association_still_archives_tag(self) -> None:
+        object_tag = self._lock("DPANN")
+        ObjectTag.objects.filter(pk=object_tag.pk).update(archived=True)
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+
+    def test_parent_with_only_archived_children_needs_no_flag(self) -> None:
+        self._lock("Eubacteria")
+        self.taxonomy.delete_tags(["Eubacteria", "Archaebacteria"])
+
+        self.taxonomy.delete_tags(["Bacteria"])
+
+        assert self._archived_values() == {"Bacteria", "Eubacteria"}
+        assert self._existing("Archaebacteria") == set()
+
+    def test_unarchived_tag_beneath_archived_child_still_needs_flag(self) -> None:
+        """
+        The `with_subtags` check looks at every level, so an unarchived tag below an archived child still counts.
+        """
+        self._lock("Eubacteria")
+        self.taxonomy.delete_tags(["Eubacteria", "Archaebacteria"])
+        # A tag import can move an unarchived tag under an archived one.
+        dpann = get_tag("DPANN")
+        dpann.parent = get_tag("Eubacteria")
+        dpann.save()
+
+        with pytest.raises(ValueError, match="contain children"):
+            self.taxonomy.delete_tags(["Bacteria"])
+
+        assert self._archived_values() == {"Eubacteria"}
+        assert self._existing("Bacteria", "DPANN") == {"Bacteria", "DPANN"}
+
+    def test_empty_request_writes_nothing(self) -> None:
+        tags_before = set(Tag.objects.values_list("pk", "archived"))
+
+        self.taxonomy.delete_tags([])
+
+        assert set(Tag.objects.values_list("pk", "archived")) == tags_before
+
+    @patch("openedx_tagging.signal_handlers.emit_content_object_associations_changed_for_object_ids_task.delay")
+    def test_deleted_tag_under_archived_parent_updates_search_index(self, mock_task_delay) -> None:
+        api.tag_object("obj-a", self.taxonomy, ["Arthropoda"])
+        self._lock("Mammalia")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.taxonomy.delete_tags(["Animalia"], with_subtags=True)
+
+        notified = {object_id for call in mock_task_delay.call_args_list for object_id in call.kwargs["object_ids"]}
+        assert "obj-a" in notified
+
+    @ddt.data(
+        ("free_text_taxonomy", ["anything"], "free text taxonomies"),
+        ("read_only_taxonomy", ["System Tag 1"], "read-only taxonomies"),
+        ("taxonomy", ["DPANN", "No Such Tag"], "Invalid tag id provided"),
+        ("taxonomy", ["Bacteria"], "contain children"),
+    )
+    @ddt.unpack
+    def test_validation_error_writes_nothing(self, taxonomy_attr: str, tags: list[str], message: str) -> None:
+        self._lock("DPANN")
+        api.tag_object("free-text-object", self.free_text_taxonomy, ["anything"])
+        tags_before = set(Tag.objects.values_list("pk", "archived"))
+
+        with pytest.raises(ValueError, match=message):
+            getattr(self, taxonomy_attr).delete_tags(tags)
+
+        assert set(Tag.objects.values_list("pk", "archived")) == tags_before
+
+    def test_archive_query_count_does_not_grow(self) -> None:
+        values = ["DPANN", "Euryarchaeida", "Proteoarchaeota", "Eubacteria", "Archaebacteria", "Mammalia"]
+        for index, value in enumerate(values):
+            self._lock(value, f"object-{index}")
+
+        with CaptureQueriesContext(connection) as one_tag:
+            self.taxonomy.delete_tags(values[:1])
+        with CaptureQueriesContext(connection) as five_tags:
+            self.taxonomy.delete_tags(values[1:])
+
+        assert self._archived_values() == set(values)
+        assert len(one_tag) == len(five_tags)
+
+    def test_locked_sub_tag_with_stale_lineage_is_not_cascaded(self) -> None:
+        """
+        A sub-tag is found through its parent, as the cascade finds it, even if its lineage is out of date.
+        """
+        self._lock("Eubacteria")
+        Tag.objects.filter(pk=self.eubacteria.pk).update(lineage="Renamed\tEubacteria\t")
+
+        self.taxonomy.delete_tags(["Bacteria"], with_subtags=True)
+
+        assert self._archived_values() == {"Bacteria", "Eubacteria"}
+        assert self._existing("Archaebacteria") == set()
+
+    def test_more_tags_than_one_statement_can_join_with_or(self) -> None:
+        taxonomy = api.create_taxonomy("Large")
+        values = [f"tag {index}" for index in range(1100)]
+        Tag.objects.bulk_create(
+            Tag(taxonomy=taxonomy, value=value, external_id=value, lineage=f"{value}\t") for value in values
+        )
+
+        taxonomy.delete_tags(values)
+
+        assert not taxonomy.tag_set.exists()
+
+    def test_lock_set_after_the_read_archives_on_the_next_attempt(self) -> None:
+        api.tag_object("obj", self.taxonomy, ["DPANN"])
+        object_tag = ObjectTag.objects.get(object_id="obj")
+        dpann = get_tag("DPANN")
+
+        with concurrent_write(Tag, lambda: ObjectTag.objects.filter(pk=object_tag.pk).update(deletion_locked=True)):
+            self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._archived_values() == {"DPANN"}
+        assert ObjectTag.objects.get(pk=object_tag.pk).tag_id == dpann.pk
+
+    def test_sub_tag_added_after_the_read_is_not_cascaded(self) -> None:
+        dpann = get_tag("DPANN")
+
+        def add_sub_tag() -> None:
+            Tag.objects.get_or_create(taxonomy=self.taxonomy, value="Kid", parent=dpann)
+
+        with concurrent_write(Tag, add_sub_tag):
+            with pytest.raises(ValueError, match="contain children"):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._existing("DPANN", "Kid") == {"DPANN", "Kid"}
+
+    def test_concurrent_writes_on_every_attempt_end_in_a_conflict_error(self) -> None:
+        """
+        A delete that concurrent writes keep getting in the way of ends in its own error, not a database one.
+        """
+        dpann = get_tag("DPANN")
+        kids: list[Tag] = []
+
+        def add_another_sub_tag() -> None:
+            kids.append(Tag.objects.create(taxonomy=self.taxonomy, value=f"Kid {len(kids)}", parent=dpann))
+
+        with concurrent_write(Tag, add_another_sub_tag):
+            with pytest.raises(api.ConcurrentDeleteError):
+                self.taxonomy.delete_tags(["DPANN"], with_subtags=True)
+
+        assert self._existing("DPANN") == {"DPANN"}
+
+    def test_sub_tag_added_while_archiving_is_not_left_behind(self) -> None:
+        """
+        A request that only archives still notices a sub-tag that another transaction added after the read.
+        """
+        self._lock("DPANN")
+        dpann = get_tag("DPANN")
+
+        def add_sub_tag() -> None:
+            Tag.objects.get_or_create(taxonomy=self.taxonomy, value="Kid", parent=dpann)
+
+        with concurrent_write(Tag, add_sub_tag, before="update"):
+            self.taxonomy.delete_tags(["DPANN"], with_subtags=True)
+
+        assert self._archived_values() == {"DPANN"}
+        assert self._existing("Kid") == set()
+
+    def test_locked_association_that_already_had_no_tag_does_not_block_deletes(self) -> None:
+        """
+        A deletion-locked association with no tag that was there before the delete is not mistaken for one the
+        delete orphaned.
+        """
+        api.tag_object("unresolved", self.taxonomy, ["Ghost"], create_invalid=True)
+        unresolved = ObjectTag.objects.get(object_id="unresolved")
+        assert unresolved.tag_id is None
+        api.lock_object_tags_for_deletion(unresolved.pk)
+
+        self.taxonomy.delete_tags(["DPANN"])
+
+        assert self._existing("DPANN") == set()
+
+    def test_rename_is_refused_when_the_tag_is_archived_after_it_was_read(self) -> None:
+        """
+        update_tag() checks `archived` again after saving, so a rename can't land on a tag archived meanwhile.
+        """
+        dpann = get_tag("DPANN")
+        real_clean = Tag.clean
+
+        def archive_then_clean(tag: Tag) -> None:
+            # Tag.save() calls clean() first, after update_tag() has read the tag.
+            Tag.objects.filter(pk=dpann.pk).update(archived=True)
+            real_clean(tag)
+
+        with patch.object(Tag, "clean", archive_then_clean):
+            with pytest.raises(ValueError, match="archived"):
+                self.taxonomy.update_tag("DPANN", "Renamed")
+
+        dpann.refresh_from_db()
+        assert dpann.value == "DPANN"
+
+    def test_rename_does_not_write_archived(self) -> None:
+        """
+        update_tag() saves every column except `archived`, so it can't write a stale `archived=False` back.
+        """
+        dpann = get_tag("DPANN")
+        with CaptureQueriesContext(connection) as queries:
+            self.taxonomy.update_tag("DPANN", "Renamed")
+
+        statements = [query["sql"] for query in queries]
+        updates = [sql for sql in statements if sql.startswith("UPDATE") and "oel_tagging_tag" in sql]
+        assert updates
+        assert not any('"archived" =' in sql or "`archived` =" in sql for sql in updates)
+        dpann.refresh_from_db()
+        assert dpann.value == "Renamed"
+
+    def test_rename_keeps_parent_depth_and_lineage_in_agreement(self) -> None:
+        """
+        A rename that races a move writes the parent it read along with the depth and lineage it computed from it.
+        """
+        dpann = get_tag("DPANN")
+        real_clean = Tag.clean
+        moves = [get_tag("Mammalia")]
+
+        def move_then_clean(tag: Tag) -> None:
+            # Tag.save() calls clean() first, after update_tag() has read the tag. Moving the tag saves it too,
+            # so the move is made only once.
+            if moves:
+                moved = Tag.objects.get(pk=dpann.pk)
+                moved.parent = moves.pop()
+                moved.save()
+            real_clean(tag)
+
+        with patch.object(Tag, "clean", move_then_clean):
+            self.taxonomy.update_tag("DPANN", "Renamed")
+
+        dpann.refresh_from_db()
+        assert dpann.parent is not None
+        assert dpann.lineage == dpann.parent.lineage + "Renamed\t"
+        assert dpann.depth == dpann.parent.depth + 1
+
+    def test_rename_fills_in_a_blank_external_id(self) -> None:
+        dpann = get_tag("DPANN")
+        Tag.objects.filter(pk=dpann.pk).update(external_id="")
+
+        self.taxonomy.update_tag("DPANN", "Renamed")
+
+        dpann.refresh_from_db()
+        assert dpann.external_id != ""
+
+    def test_protected_tag_is_not_retried(self) -> None:
+        with patch.object(QuerySet, "delete", side_effect=ProtectedError("protected", set())) as delete:
+            with pytest.raises(ProtectedError):
+                self.taxonomy.delete_tags(["DPANN"])
+
+        # The call count is the only thing that tells a single attempt from three, since each one fails the same way.
+        delete.assert_called_once()
+        assert self._existing("DPANN") == {"DPANN"}
