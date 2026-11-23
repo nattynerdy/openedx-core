@@ -1,5 +1,5 @@
 """
-Receivers that keep competency criteria groups in step with the deletion of their criteria.
+Receivers that keep criteria groups in step with deleted criteria and archived associations, tags, and taxonomies.
 
 A ``CompetencyCriterion`` is deleted by cascade when its ``ObjectTag`` is deleted, which is what
 happens when Studio deletes a subsection or ``tag_object()`` removes a tag. The criterion's group,
@@ -10,16 +10,18 @@ here walk that lineage and delete or archive each group the same way
 A tagging-layer delete removes an ``ObjectTag`` only while it is unlocked.
 ``lock_object_tags_for_deletion()`` locks the associations a learner status depends on, and
 ``_reconcile_object_tags()`` locks those that only archived criteria still use. Deleting a locked
-association archives it instead, which cascades into no criteria and fires no receiver here.
+association archives it instead, which cascades into no criteria, so none of the delete receivers fires.
+The tagging layer sends ``object_tags_archived`` for it instead, and ``_associations_archived()``
+archives the criteria that still use the association and each group that archiving them leaves empty.
 
-The receivers react only to a delete whose origin is an ``ObjectTag`` or a ``CourseRun``. An ``ObjectTag``
+The delete receivers react only to a delete whose origin is an ``ObjectTag`` or a ``CourseRun``. An ``ObjectTag``
 always arrives as a queryset, because the tagging layer deletes through ``ObjectTagQuerySet``; a ``CourseRun``
 arrives as an instance or as a queryset. Deleting a ``CourseRun`` cascades to its course-level groups,
 which leaves the shared root without a course beneath it and the ``ObjectTag`` of each deleted criterion
 possibly unused. A criterion deleted for any other reason, including by
 ``delete_or_archive_competency_criterion()`` itself, is handled by whoever deleted it.
 
-The receivers never roll back the deletion that triggered them: a failure while cleaning up is logged
+The receivers never roll back the deletion or the archive that triggered them: a failure while cleaning up is logged
 and the groups stay in place. They also add no knowledge of CBE to ``openedx_tagging``; the dependency
 points the other way, from this applet to the tagging models.
 """
@@ -32,8 +34,9 @@ from django.dispatch import receiver
 
 from openedx_catalog.models_api import CourseRun
 from openedx_tagging.models import ObjectTag, Tag
+from openedx_tagging.signals import object_tags_archived
 
-from .api import _cascade_remove_from_group, _reconcile_object_tags
+from .api import _cascade_remove_from_group, _reconcile_object_tags, _write_criterion_archived
 from .models import CompetencyCriteriaGroup, CompetencyCriterion
 
 log = logging.getLogger(__name__)
@@ -63,9 +66,14 @@ def _lineage_state(group: CompetencyCriteriaGroup) -> dict[int, bool]:
     return state
 
 
-def _clean_up_from(group_id: int, trigger: str, *, using: str | None = None) -> None:
+def _clean_up_from(
+    group_id: int, trigger: str, *, archive_object_tag_ids: set[int] | None = None, using: str | None = None
+) -> None:
     """
     Walk up from ``group_id``, deleting or archiving each group left with no live children, and log the outcome.
+
+    When ``archive_object_tag_ids`` is given, the live criteria of the group that use those associations are
+    archived first, under the same lock and in the same savepoint as the walk, so a failure leaves them live.
 
     ``using`` is the alias of the database the triggering write went to. Every query and write here runs on it,
     because the router may send reads to a replica that has not yet seen that write. When ``using`` is
@@ -89,9 +97,15 @@ def _clean_up_from(group_id: int, trigger: str, *, using: str | None = None) -> 
             if group is None:
                 return
             before = _lineage_state(group)
+            if archive_object_tag_ids:
+                live_criteria = CompetencyCriterion.objects.using(using).filter(
+                    group_id=group.pk, object_tag_id__in=archive_object_tag_ids, archived=False
+                )
+                for criterion in live_criteria:
+                    _write_criterion_archived(criterion, None, using)
             _cascade_remove_from_group(group, None, using)
     except OperationalError:
-        # A MySQL deadlock has already rolled back the whole transaction, so swallowing it would only move
+        # A deadlock or a lock wait timeout has left the transaction unusable, so swallowing it would only move
         # the error to the next statement.
         raise
     except Exception:  # pylint: disable=broad-exception-caught
@@ -110,6 +124,43 @@ def _clean_up_from(group_id: int, trigger: str, *, using: str | None = None) -> 
             log.info("Group cleanup removed CompetencyCriteriaGroup %s after %s", pk, trigger)
         elif after[pk] and not was_archived:
             log.info("Group cleanup archived CompetencyCriteriaGroup %s after %s", pk, trigger)
+
+
+@receiver(object_tags_archived, sender=ObjectTag)
+def _associations_archived(object_tag_ids: list[int], using: str | None = None, **kwargs) -> None:
+    """
+    Archive the live criteria that use newly archived associations, and each group left with no live children.
+
+    The tagging layer sends this signal, inside the transaction that archived the associations, when it removes a
+    deletion-locked ``ObjectTag``. The criteria on that association survive the removal, so their rule is archived
+    here. Re-applying the tag revives the association and leaves the rule archived.
+
+    The live criteria are read before any lock is taken, restricted to associations that are archived, and the
+    receiver returns when there are none. That makes the signals sent from ``_reconcile_object_tags()`` cost one
+    query, because the code that calls it has already archived its criteria. Each group is then cleaned up under
+    its own savepoint and ``Tag`` lock, in ``(tag_id, group_id)`` order. The same ids may arrive twice; the second
+    pass finds no live criteria and changes nothing.
+
+    The read that finds the live criteria is not inside a savepoint. A database error in it propagates and rolls
+    back the archive that sent the signal, which only a test can produce.
+
+    ``using`` is the database alias the archive was written on. All of the receiver's queries and writes run on it.
+    """
+    object_tag_ids_by_group: dict[tuple[int, int], set[int]] = {}
+    for tag_id, group_id, object_tag_id in (
+        CompetencyCriterion.objects.using(using)
+        .filter(object_tag_id__in=object_tag_ids, object_tag__archived=True, archived=False)
+        .values_list("group__tag_id", "group_id", "object_tag_id")
+    ):
+        object_tag_ids_by_group.setdefault((tag_id, group_id), set()).add(object_tag_id)
+    archived_ids = {object_tag_id for ids in object_tag_ids_by_group.values() for object_tag_id in ids}
+    for (_tag_id, group_id), group_object_tag_ids in sorted(object_tag_ids_by_group.items()):
+        _clean_up_from(
+            group_id,
+            f"ObjectTags {sorted(group_object_tag_ids)} archived",
+            archive_object_tag_ids=archived_ids,
+            using=using,
+        )
 
 
 @receiver(post_delete, sender=CompetencyCriterion)

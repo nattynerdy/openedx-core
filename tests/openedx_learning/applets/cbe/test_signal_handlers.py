@@ -1,16 +1,20 @@
-"""Tests for the receivers that clean up criteria groups when a criterion is deleted with its ObjectTag."""
+"""
+Tests for the receivers that keep criteria groups in step with the deletion of their criteria, and with the
+archiving of associations, tags, and taxonomies.
+"""
 import logging
 from collections.abc import Callable, Iterator
 
 import pytest
 import rules
+from django.apps import apps
 from django.db import OperationalError
 from django.db.models import ProtectedError
 from django.test import override_settings
 from rules.permissions import permissions as rule_permissions
 
 from openedx_catalog.models import CourseRun
-from openedx_learning.api import delete_or_archive_competency_criterion
+from openedx_learning.api import delete_or_archive_competency_criteria_group, delete_or_archive_competency_criterion
 from openedx_learning.applets.cbe import signal_handlers
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
@@ -23,6 +27,7 @@ from openedx_learning.models import (
 )
 from openedx_tagging.api import delete_object_tags, lock_object_tags_for_deletion, tag_object
 from openedx_tagging.models import ObjectTag, Tag
+from openedx_tagging.signals import object_tags_archived
 
 pytestmark = pytest.mark.django_db
 
@@ -190,22 +195,27 @@ def test_a_leaf_directly_under_the_root_removes_both_and_logs_two_lines(
     assert sorted(_ids_named_in(_cleanup_lines(caplog))) == sorted([root.pk, leaf.pk])
 
 
-def test_deleting_a_locked_object_tag_archives_it_and_leaves_criteria_and_groups_alone(
+def test_deleting_a_locked_object_tag_archives_it_and_its_criterion_and_groups(
     *, tag, course_run, object_tag, default_rule_profile, caplog,
 ) -> None:
-    """A locked ObjectTag is archived by the delete, so no criterion is cascaded away and no receiver logs."""
+    """A locked ObjectTag is archived by the delete, which archives its criterion and groups instead of deleting."""
     root, course_level, leaf = _tree(tag, course_run)
     criterion = _make_criterion(leaf, object_tag, default_rule_profile)
     lock_object_tags_for_deletion(object_tag.pk)
+    trigger = f"ObjectTags [{object_tag.pk}] archived"
 
     with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
         delete_object_tags(object_tag.object_id)
 
     stored = ObjectTag.objects.get(pk=object_tag.pk)
     assert stored.archived is True
-    assert CompetencyCriterion.objects.filter(pk=criterion.pk, object_tag=stored, archived=False).exists()
-    assert [_archived(g) for g in (root, course_level, leaf)] == [False, False, False]
-    assert _cleanup_lines(caplog) == []
+    assert CompetencyCriterion.objects.filter(pk=criterion.pk, object_tag=stored, archived=True).exists()
+    assert [_archived(g) for g in (root, course_level, leaf)] == [True, True, True]
+    assert _cleanup_lines(caplog) == [
+        f"Group cleanup archived CompetencyCriteriaGroup {leaf.pk} after {trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {course_level.pk} after {trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {root.pk} after {trigger}",
+    ]
 
 
 def _delete_criterion_through_the_api(criterion, user):
@@ -579,7 +589,7 @@ def test_an_already_locked_object_tag_nothing_uses_is_archived_by_a_course_delet
 def test_one_delete_archives_a_locked_object_tag_and_removes_an_unlocked_one_with_its_groups(
     *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog,
 ) -> None:
-    """A single delete keeps the locked ObjectTag's criterion and groups, and cleans up after the unlocked one."""
+    """A single delete archives the locked ObjectTag's rule, and removes the unlocked one's criterion and groups."""
     tag_b = Tag.objects.create(taxonomy=competency_taxonomy, value="Revising Poetry")
     root_a, course_a, leaf_a = _tree(tag, course_run)
     root_b, course_b, leaf_b = _tree(tag_b, course_run)
@@ -588,14 +598,15 @@ def test_one_delete_archives_a_locked_object_tag_and_removes_an_unlocked_one_wit
     criterion_b = _make_criterion(leaf_b, object_tag_b, default_rule_profile)
     lock_object_tags_for_deletion(object_tag.pk)
     trigger = f"CompetencyCriterion {criterion_b.pk} deleted with ObjectTag {object_tag_b.pk}"
+    archive_trigger = f"ObjectTags [{object_tag.pk}] archived"
 
     with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
         delete_object_tags(object_tag.object_id)
 
     stored = ObjectTag.objects.get(pk=object_tag.pk)
     assert stored.archived is True
-    assert CompetencyCriterion.objects.filter(pk=criterion_a.pk, object_tag=stored, archived=False).exists()
-    assert [_archived(g) for g in (root_a, course_a, leaf_a)] == [False, False, False]
+    assert CompetencyCriterion.objects.filter(pk=criterion_a.pk, object_tag=stored, archived=True).exists()
+    assert [_archived(g) for g in (root_a, course_a, leaf_a)] == [True, True, True]
     assert not ObjectTag.objects.filter(pk=object_tag_b.pk).exists()
     assert not CompetencyCriterion.objects.filter(pk=criterion_b.pk).exists()
     assert not CompetencyCriteriaGroup.objects.filter(pk__in=[root_b.pk, course_b.pk, leaf_b.pk]).exists()
@@ -603,6 +614,9 @@ def test_one_delete_archives_a_locked_object_tag_and_removes_an_unlocked_one_wit
         f"Group cleanup removed CompetencyCriteriaGroup {leaf_b.pk} after {trigger}",
         f"Group cleanup removed CompetencyCriteriaGroup {course_b.pk} after {trigger}",
         f"Group cleanup removed CompetencyCriteriaGroup {root_b.pk} after {trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {leaf_a.pk} after {archive_trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {course_a.pk} after {archive_trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {root_a.pk} after {archive_trigger}",
     ]
 
 
@@ -775,6 +789,294 @@ def test_a_course_group_with_no_parent_still_reconciles_its_object_tags(
     assert _cleanup_lines(caplog) == []
 
 
+def _archive_locked_association(object_tag: ObjectTag, taxonomy: CompetencyTaxonomy) -> None:
+    """Lock ``object_tag`` and remove it with tag_object(), which archives it instead of deleting it."""
+    lock_object_tags_for_deletion(object_tag.pk)
+    tag_object(object_tag.object_id, taxonomy, [])
+
+
+def _criterion_archived(criterion: CompetencyCriterion) -> bool:
+    """Return the criterion's archived flag as stored."""
+    return CompetencyCriterion.objects.get(pk=criterion.pk).archived
+
+
+def _history_count(model_name: str, ids: list[int]) -> int:
+    """
+    Return how many history rows the given ``CompetencyCriterion`` or ``CompetencyCriteriaGroup`` ids have.
+
+    The historical model comes from the app registry because simple_history's ``.history`` has no type stubs.
+    """
+    return apps.get_model("openedx_learning", f"Historical{model_name}").objects.filter(id__in=ids).count()
+
+
+def test_archiving_a_locked_association_archives_its_criterion_and_empty_lineage(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog,
+) -> None:
+    """Removing a locked association archives its criterion and each group above it left with no live child."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    trigger = f"ObjectTags [{object_tag.pk}] archived"
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        _archive_locked_association(object_tag, competency_taxonomy)
+
+    assert ObjectTag.objects.get(pk=object_tag.pk).archived is True
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is True
+    assert [_archived(g) for g in (leaf, course_level, root)] == [True, True, True]
+    assert _cleanup_lines(caplog) == [
+        f"Group cleanup archived CompetencyCriteriaGroup {leaf.pk} after {trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {course_level.pk} after {trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {root.pk} after {trigger}",
+    ]
+
+
+def test_two_criteria_in_one_group_log_the_group_once(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog,
+) -> None:
+    """Both criteria are archived, and the group they share is logged once, not once per criterion."""
+    _, _, leaf = _tree(tag, course_run)
+    first = _make_criterion(leaf, object_tag, default_rule_profile)
+    other_tag = _make_object_tag(competency_taxonomy, tag, OTHER_OBJECT_ID)
+    second = _make_criterion(leaf, other_tag, default_rule_profile)
+    lock_object_tags_for_deletion([object_tag.pk, other_tag.pk])
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        ObjectTag.objects.filter(pk__in=[object_tag.pk, other_tag.pk]).delete()
+
+    assert CompetencyCriterion.objects.filter(pk__in=[first.pk, second.pk], archived=True).count() == 2
+    assert _ids_named_in(_cleanup_lines(caplog)).count(leaf.pk) == 1
+
+
+def test_reviving_an_association_leaves_the_rule_archived(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog,
+) -> None:
+    """Re-applying the tag revives the association, while the criterion and its groups stay archived, silently."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    _archive_locked_association(object_tag, competency_taxonomy)
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        tag_object(object_tag.object_id, competency_taxonomy, [tag.value])
+
+    assert ObjectTag.objects.get(pk=object_tag.pk).archived is False
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is True
+    assert [_archived(g) for g in (leaf, course_level, root)] == [True, True, True]
+    assert _cleanup_lines(caplog) == []
+
+
+@pytest.mark.parametrize("sibling_group", ["same_leaf", "sibling_leaf"])
+def test_live_sibling_criterion_stops_the_archive_walk(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog, sibling_group,
+) -> None:
+    """
+    A live criterion next to the archived one keeps its own group and every group above it live.
+
+    A sibling in the same leaf keeps that leaf live, and a sibling in another leaf keeps the course-level group
+    and the root live. Only the groups the archive emptied are logged.
+    """
+    root, course_level, leaf = _tree(tag, course_run)
+    sibling_leaf = leaf if sibling_group == "same_leaf" else CompetencyCriteriaGroup.objects.create(
+        tag=tag, parent=course_level
+    )
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    sibling = _make_criterion(
+        sibling_leaf, _make_object_tag(competency_taxonomy, tag, OTHER_OBJECT_ID), default_rule_profile
+    )
+    trigger = f"ObjectTags [{object_tag.pk}] archived"
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        _archive_locked_association(object_tag, competency_taxonomy)
+
+    leaf_is_archived = sibling_group == "sibling_leaf"
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is True
+    assert CompetencyCriterion.objects.get(pk=sibling.pk).archived is False
+    assert [_archived(g) for g in (leaf, course_level, root, sibling_leaf)] == [
+        leaf_is_archived, False, False, False
+    ]
+    assert _cleanup_lines(caplog) == (
+        [f"Group cleanup archived CompetencyCriteriaGroup {leaf.pk} after {trigger}"] if leaf_is_archived else []
+    )
+
+
+def test_archiving_the_association_of_an_already_archived_rule_is_a_silent_no_op(
+    *, user, now, tag, course_run, object_tag, default_rule_profile, caplog, django_assert_num_queries,
+) -> None:
+    """
+    Archiving a criterion through the authoring API archives its association, and that signal changes nothing more.
+
+    The receiver is reached, finds no live criterion, and writes no further history row. Sent again, it runs one
+    query, so it takes no group lock.
+    """
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+    group_ids = [leaf.pk, course_level.pk, root.pk]
+    criterion_history = _history_count("CompetencyCriterion", [criterion.pk])
+    group_history = _history_count("CompetencyCriteriaGroup", group_ids)
+    sent: list[list[int]] = []
+
+    def _record(object_tag_ids, **_kwargs):
+        sent.append(object_tag_ids)
+
+    object_tags_archived.connect(_record)
+    try:
+        with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+            delete_or_archive_competency_criterion(criterion.id, user)
+    finally:
+        object_tags_archived.disconnect(_record)
+
+    assert sent == [[object_tag.pk]]
+    assert ObjectTag.objects.get(pk=object_tag.pk).archived is True
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is True
+    assert [_archived(g) for g in (leaf, course_level, root)] == [True, True, True]
+    assert _history_count("CompetencyCriterion", [criterion.pk]) == criterion_history + 1
+    assert _history_count("CompetencyCriteriaGroup", group_ids) == group_history + len(group_ids)
+    assert _cleanup_lines(caplog) == []
+    with django_assert_num_queries(1):
+        object_tags_archived.send(sender=ObjectTag, object_tag_ids=sent[0], using="default")
+
+
+def test_group_archive_reconcile_is_a_silent_no_op(
+    *, user, now, tag, course_run, object_tag, default_rule_profile, caplog, django_assert_num_queries,
+) -> None:
+    """The signal sent from inside a group archive's own reconcile finds no live criteria and runs one query."""
+    _, _, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+    sent: list[list[int]] = []
+
+    def _record(object_tag_ids, **_kwargs):
+        sent.append(object_tag_ids)
+
+    object_tags_archived.connect(_record)
+    try:
+        with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+            delete_or_archive_competency_criteria_group(leaf.pk, user)
+    finally:
+        object_tags_archived.disconnect(_record)
+
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is True
+    assert sent == [[object_tag.pk]]
+    assert _cleanup_lines(caplog) == []
+    with django_assert_num_queries(1):
+        object_tags_archived.send(sender=ObjectTag, object_tag_ids=sent[0], using="default")
+
+
+def test_object_tags_archived_twice_changes_and_logs_nothing_the_second_time(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog,
+) -> None:
+    """Sending the same ids again, as a concurrent archive can, writes no history row and logs nothing."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    _archive_locked_association(object_tag, competency_taxonomy)
+    group_ids = [leaf.pk, course_level.pk, root.pk]
+    criterion_history = _history_count("CompetencyCriterion", [criterion.pk])
+    group_history = _history_count("CompetencyCriteriaGroup", group_ids)
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        object_tags_archived.send(sender=ObjectTag, object_tag_ids=[object_tag.pk])
+
+    assert _history_count("CompetencyCriterion", [criterion.pk]) == criterion_history
+    assert _history_count("CompetencyCriteriaGroup", group_ids) == group_history
+    assert _cleanup_lines(caplog) == []
+
+
+def test_object_tags_archived_for_a_live_association_changes_and_logs_nothing(
+    *, tag, course_run, object_tag, default_rule_profile, caplog,
+) -> None:
+    """A signal that names an association that is not archived leaves its live criterion and groups alone."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    group_ids = [leaf.pk, course_level.pk, root.pk]
+    group_history = _history_count("CompetencyCriteriaGroup", group_ids)
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        object_tags_archived.send(sender=ObjectTag, object_tag_ids=[object_tag.pk], using="default")
+
+    assert _criterion_archived(criterion) is False
+    assert [_archived(g) for g in (leaf, course_level, root)] == [False, False, False]
+    assert _history_count("CompetencyCriteriaGroup", group_ids) == group_history
+    assert _cleanup_lines(caplog) == []
+
+
+def test_association_archive_cleans_up_groups_in_tag_then_group_order(
+    *, competency_taxonomy, tag, course_run, default_rule_profile, caplog,
+) -> None:
+    """
+    Groups are processed by competency tag, then by group, so every receiver takes the Tag locks in one order.
+
+    The second competency's groups and association are created first, so they have the lower primary keys, while
+    its tag has the higher one. Only the receiver's ordering puts the first competency's groups first.
+    """
+    tag_b = Tag.objects.create(taxonomy=competency_taxonomy, value="Other Competency")
+    groups_b = _tree(tag_b, course_run)
+    object_tag_b = _make_object_tag(competency_taxonomy, tag_b, OTHER_OBJECT_ID)
+    groups_a = _tree(tag, course_run)
+    object_tag_a = _make_object_tag(competency_taxonomy, tag, OTHER_OBJECT_ID)
+    _make_criterion(groups_b[2], object_tag_b, default_rule_profile)
+    _make_criterion(groups_a[2], object_tag_a, default_rule_profile)
+    lock_object_tags_for_deletion([object_tag_a.pk, object_tag_b.pk])
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        delete_object_tags(OTHER_OBJECT_ID)
+
+    logged_ids = _ids_named_in(_cleanup_lines(caplog))
+    assert len(logged_ids) == 6
+    assert set(logged_ids[:3]) == {g.pk for g in groups_a}
+    assert set(logged_ids[3:]) == {g.pk for g in groups_b}
+
+
+def test_association_archive_cleanup_failure_is_logged_and_criteria_stay_unarchived(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, monkeypatch, caplog,
+) -> None:
+    """A failing cascade rolls back that group's savepoint, including the criterion archive; the archive commits."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(signal_handlers, "_cascade_remove_from_group", _boom)
+
+    with caplog.at_level(logging.WARNING, logger=signal_handlers.__name__):
+        _archive_locked_association(object_tag, competency_taxonomy)
+
+    assert ObjectTag.objects.get(pk=object_tag.pk).archived is True
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is False
+    assert [_archived(g) for g in (leaf, course_level, root)] == [False, False, False]
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"Group cleanup failed after ObjectTags [{object_tag.pk}] archived; "
+        f"CompetencyCriteriaGroups left in place: {sorted([leaf.pk, course_level.pk, root.pk])}"
+    )
+    assert record.exc_info is not None
+
+
+def test_a_lock_error_in_the_association_archive_cleanup_is_not_swallowed(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, monkeypatch,
+) -> None:
+    """A database OperationalError propagates out of the archive that triggered the receiver."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+
+    def _deadlock(*_args, **_kwargs):
+        raise OperationalError("Deadlock found")
+
+    monkeypatch.setattr(signal_handlers, "_cascade_remove_from_group", _deadlock)
+
+    with pytest.raises(OperationalError):
+        _archive_locked_association(object_tag, competency_taxonomy)
+
+    assert ObjectTag.objects.get(pk=object_tag.pk).archived is False
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is False
+    assert [_archived(g) for g in (root, course_level, leaf)] == [False, False, False]
+
+
 class _ReadsElsewhereRouter:
     """Sends reads to a database alias that is not configured, and writes to the default one."""
 
@@ -811,3 +1113,18 @@ def test_the_course_run_receivers_run_every_query_on_the_alias_they_were_sent(
 
     assert not CompetencyCriteriaGroup.objects.filter(pk=root.pk).exists()
     assert not ObjectTag.objects.filter(pk=object_tag.pk).exists()
+
+
+def test_the_association_archive_receiver_runs_every_query_on_the_alias_it_was_sent(
+    *, tag, course_run, object_tag, default_rule_profile,
+) -> None:
+    """With reads routed to an unconfigured alias, the cleanup still completes, so no query left the sent alias."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    lock_object_tags_for_deletion(object_tag.pk)
+
+    with override_settings(DATABASE_ROUTERS=[_ReadsElsewhereRouter()]):
+        ObjectTag.objects.filter(pk=object_tag.pk).delete()
+
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is True
+    assert [_archived(g) for g in (root, course_level, leaf)] == [True, True, True]

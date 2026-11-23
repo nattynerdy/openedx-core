@@ -1390,7 +1390,7 @@ def _reconcile_object_tags(candidate_ids: set[int], using: str | None = None) ->
         .values_list("object_tag_id", flat=True)
     )
     if referenced:
-        lock_object_tags_for_deletion(referenced)
+        lock_object_tags_for_deletion(referenced, using=using)
     ObjectTag.objects.using(using).filter(pk__in=to_remove).delete()
 
 
